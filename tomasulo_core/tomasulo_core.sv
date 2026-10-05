@@ -2,9 +2,7 @@ module tomasulo_core (
     input  logic        clk,
     input  logic        reset,
 
-    // ------------------------------------------------------------
-    // Decoded instruction from frontend
-    // ------------------------------------------------------------
+    // decoded_inst (Frontend)
     input  logic        dec_valid,
     input  logic        dec_supported,
     input  logic [31:0] dec_pc,
@@ -12,209 +10,120 @@ module tomasulo_core (
     input  logic [4:0]  dec_rd,
     input  logic [4:0]  dec_rs1,
     input  logic [4:0]  dec_rs2,
-    input  logic [2:0]  dec_funct3,
-    input  logic [6:0]  dec_funct7,
+    input  logic [2:0]  dec_funct3,  
+    input  logic [6:0]  dec_funct7,  
     input  logic [31:0] dec_imm,
     input  logic [3:0]  dec_op_name,
 
-    // ------------------------------------------------------------
-    // RAT
-    // ------------------------------------------------------------
-    output logic [4:0]  rat_lookup_reg1,
-    output logic [4:0]  rat_lookup_reg2,
+    // rat_lookup_tags (from RAT)
+    input  logic [3:0]  tag1,
+    input  logic [3:0]  tag2,
 
-    input  logic [3:0]  rat_tag1,
-    input  logic [3:0]  rat_tag2,
+    // arf_read_data (from ARF)
+    input  logic [31:0] read_data1,
+    input  logic [31:0] read_data2,
 
+    // rs_read_data (from RS)
+    input  logic        has_free,
+    input  logic [3:0]  free_tag,
+
+    // cdb inputs (from CDB)
+    input  logic        cdb_valid,
+    input  logic [3:0]  cdb_tag,
+    input  logic [31:0] cdb_data,
+    
+    // rat_lookup_regs (to RAT/ARF)
+    output logic [4:0]  lookup_reg1,
+    output logic [4:0]  lookup_reg2,
+
+    // rat_update (to RAT)
     output logic        issue_en,
     output logic [4:0]  issue_dest,
     output logic [3:0]  issue_tag,
 
-    // ------------------------------------------------------------
-    // ARF
-    // ------------------------------------------------------------
-    input  logic [31:0] arf_data1,
-    input  logic [31:0] arf_data2,
+    // rs_alloc_info (to RS)
+    output logic        alloc_en,
+    output logic [3:0]  alloc_op,
+    output logic [31:0] alloc_Vj,
+    output logic [31:0] alloc_Vk,
+    output logic [3:0]  alloc_Qj,
+    output logic [3:0]  alloc_Qk,
+    output logic [4:0]  alloc_dest,
 
-    // ------------------------------------------------------------
-    // Reservation Station
-    // ------------------------------------------------------------
-    input  logic        rs_has_free,
-    input  logic [3:0]  rs_free_tag,
-
-    output logic        rs_alloc_en,
-    output logic [3:0]  rs_alloc_op,
-    output logic [31:0] rs_alloc_Vj,
-    output logic [31:0] rs_alloc_Vk,
-    output logic [3:0]  rs_alloc_Qj,
-    output logic [3:0]  rs_alloc_Qk,
-    output logic [4:0]  rs_alloc_dest,
-
-    // ------------------------------------------------------------
-    // CDB
-    // ------------------------------------------------------------
-    input  logic        cdb_valid,
-    input  logic [3:0]  cdb_tag,
-    input  logic [31:0] cdb_data,
-
-    // ------------------------------------------------------------
-    // Frontend
-    // ------------------------------------------------------------
+    // stall (to Frontend)
     output logic        stall_frontend
 );
 
     localparam logic [6:0] OPC_R     = 7'b0110011;
-    localparam logic [6:0] OPC_I_ALU = 7'b0010011;
     localparam logic [6:0] OPC_LUI   = 7'b0110111;
     localparam logic [6:0] OPC_AUIPC = 7'b0010111;
-
     localparam logic [3:0] TAG_NONE  = 4'd0;
 
     logic issuable;
-    logic allocate;
+    
+    // issuable = decoded_inst.valid && decoded_inst.supported && rd != 0[cite: 3]
+    assign issuable = dec_valid && dec_supported && (dec_rd != 5'd0);
 
-    // ============================================================
-    // Issue qualification
-    // ============================================================
+    // Stall: stall_frontend = issuable && !has_free[cite: 3]
+    assign stall_frontend = issuable && !has_free;
 
-    assign issuable = dec_valid &&
-                      dec_supported &&
-                      (dec_rd != 5'd0);
+    // RAT lookups[cite: 3]
+    assign lookup_reg1 = dec_rs1;
+    assign lookup_reg2 = dec_rs2;
 
-    assign allocate = issuable && rs_has_free;
+    // Allocation[cite: 3]
+    assign alloc_en   = issuable && has_free;
+    assign alloc_op   = dec_op_name;
+    assign alloc_dest = dec_rd;
 
-    // ============================================================
-    // Frontend stall
-    // ============================================================
-
-    assign stall_frontend = issuable && !rs_has_free;
-
-    // ============================================================
-    // RAT / ARF lookup addresses
-    // ============================================================
-
-    assign rat_lookup_reg1 = dec_rs1;
-    assign rat_lookup_reg2 = dec_rs2;
-
-    // ============================================================
-    // Issue / RAT update
-    // ============================================================
-
-    assign issue_en   = allocate;
+    // Rename[cite: 3]
+    assign issue_en   = alloc_en;
     assign issue_dest = dec_rd;
-    assign issue_tag  = allocate ? rs_free_tag : TAG_NONE;
+    assign issue_tag  = free_tag;
 
-    // ============================================================
-    // RS allocation
-    // ============================================================
-
-    assign rs_alloc_en   = allocate;
-    assign rs_alloc_op   = dec_op_name;
-    assign rs_alloc_dest = dec_rd;
-
-    // ============================================================
-    // Operand resolution
-    //
-    // Priority:
-    //   1. Special instruction behavior
-    //   2. x0
-    //   3. RAT says value is ready
-    //   4. Same-cycle CDB bypass
-    //   5. Wait for producer tag
-    // ============================================================
-
+    // Operand 1 (j) resolution[cite: 3]
     always_comb begin
+        if (dec_opcode == OPC_LUI) begin
+            alloc_Vj = 32'd0;
+            alloc_Qj = TAG_NONE;
+        end else if (dec_opcode == OPC_AUIPC) begin
+            alloc_Vj = dec_pc;
+            alloc_Qj = TAG_NONE;
+        end else if (dec_rs1 == 5'd0) begin
+            alloc_Vj = 32'd0;
+            alloc_Qj = TAG_NONE;
+        end else if (tag1 == TAG_NONE) begin
+            alloc_Vj = read_data1;
+            alloc_Qj = TAG_NONE;
+        end else if (cdb_valid && (cdb_tag == tag1)) begin
+            alloc_Vj = cdb_data;   
+            alloc_Qj = TAG_NONE;
+        end else begin
+            alloc_Vj = 32'd0;
+            alloc_Qj = tag1;   
+        end
+    end
 
-        // -------------------------
-        // Defaults
-        // -------------------------
-        rs_alloc_Vj = 32'd0;
-        rs_alloc_Qj = TAG_NONE;
-        rs_alloc_Vk = 32'd0;
-        rs_alloc_Qk = TAG_NONE;
-
-        // ========================================================
-        // Operand J
-        // ========================================================
-
-        case (dec_opcode)
-
-            // LUI: result = 0 + imm
-            OPC_LUI: begin
-                rs_alloc_Vj = 32'd0;
-                rs_alloc_Qj = TAG_NONE;
+    // Operand 2 (k) resolution[cite: 3]
+    always_comb begin
+        if (dec_opcode == OPC_R) begin
+            if (dec_rs2 == 5'd0) begin
+                alloc_Vk = 32'd0;
+                alloc_Qk = TAG_NONE;
+            end else if (tag2 == TAG_NONE) begin
+                alloc_Vk = read_data2;
+                alloc_Qk = TAG_NONE;
+            end else if (cdb_valid && (cdb_tag == tag2)) begin
+                alloc_Vk = cdb_data;   
+                alloc_Qk = TAG_NONE;
+            end else begin
+                alloc_Vk = 32'd0;
+                alloc_Qk = tag2;   
             end
-
-            // AUIPC: result = PC + imm
-            OPC_AUIPC: begin
-                rs_alloc_Vj = dec_pc;
-                rs_alloc_Qj = TAG_NONE;
-            end
-
-            // Normal register operand
-            default: begin
-                if (dec_rs1 == 5'd0) begin
-                    rs_alloc_Vj = 32'd0;
-                    rs_alloc_Qj = TAG_NONE;
-                end
-                else if (rat_tag1 == TAG_NONE) begin
-                    rs_alloc_Vj = arf_data1;
-                    rs_alloc_Qj = TAG_NONE;
-                end
-                else if (cdb_valid && (cdb_tag == rat_tag1)) begin
-                    rs_alloc_Vj = cdb_data;
-                    rs_alloc_Qj = TAG_NONE;
-                end
-                else begin
-                    rs_alloc_Vj = 32'd0;
-                    rs_alloc_Qj = rat_tag1;
-                end
-            end
-
-        endcase
-
-        // ========================================================
-        // Operand K
-        // ========================================================
-
-        case (dec_opcode)
-
-            // R-type uses rs2
-            OPC_R: begin
-                if (dec_rs2 == 5'd0) begin
-                    rs_alloc_Vk = 32'd0;
-                    rs_alloc_Qk = TAG_NONE;
-                end
-                else if (rat_tag2 == TAG_NONE) begin
-                    rs_alloc_Vk = arf_data2;
-                    rs_alloc_Qk = TAG_NONE;
-                end
-                else if (cdb_valid && (cdb_tag == rat_tag2)) begin
-                    rs_alloc_Vk = cdb_data;
-                    rs_alloc_Qk = TAG_NONE;
-                end
-                else begin
-                    rs_alloc_Vk = 32'd0;
-                    rs_alloc_Qk = rat_tag2;
-                end
-            end
-
-            // I-type ALU, LUI, AUIPC use immediate
-            OPC_I_ALU,
-            OPC_LUI,
-            OPC_AUIPC: begin
-                rs_alloc_Vk = dec_imm;
-                rs_alloc_Qk = TAG_NONE;
-            end
-
-            // Unsupported opcode should never allocate
-            default: begin
-                rs_alloc_Vk = 32'd0;
-                rs_alloc_Qk = TAG_NONE;
-            end
-
-        endcase
-
+        end else begin
+            alloc_Vk = dec_imm;
+            alloc_Qk = TAG_NONE;
+        end
     end
 
 endmodule
